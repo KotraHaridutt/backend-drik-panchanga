@@ -1,0 +1,12 @@
+node_modules
+dist
+build
+.git
+*.backup
+*.bak
+.DS_Store
+.env
+.env.*
+README.md
+README_NEW.md
+test

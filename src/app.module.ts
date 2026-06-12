@@ -1,18 +1,10 @@
 import { Module } from '@nestjs/common';
-import { ServeStaticModule } from '@nestjs/serve-static';
-import { join } from 'path';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { PanchangaModule } from './panchanga/panchanga.module';
 
 @Module({
-  imports: [
-    ServeStaticModule.forRoot({
-      rootPath: join(__dirname, '..', 'public'),
-      serveRoot: '/',
-    }),
-    PanchangaModule,
-  ],
+  imports: [PanchangaModule],
   controllers: [AppController],
   providers: [AppService],
 })
