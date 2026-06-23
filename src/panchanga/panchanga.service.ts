@@ -19,6 +19,7 @@ const SEFLG_SWIEPH = 2;
 const SE_CALC_RISE = 1;
 const SE_CALC_SET = 2;
 const SE_SIDM_LAHIRI = 1;
+const SE_BIT_DISC_CENTER = 256;
 
 interface MatchingDate {
   date: PanchangaDate;
@@ -31,8 +32,6 @@ interface MatchingDate {
     masa: number;
     vaara: number;
   };
-  matchQuality?: "exact" | "primary";
-  nakshatraDistance?: number;
 }
 
 @Injectable()
@@ -169,7 +168,7 @@ export class PanchangaService {
       SE_SUN,
       "",
       SEFLG_SWIEPH,
-      SE_CALC_RISE,
+      SE_BIT_DISC_CENTER + SE_CALC_RISE,
       [longitude, latitude, 0],
       1013.25,
       15
@@ -193,7 +192,7 @@ export class PanchangaService {
       SE_SUN,
       "",
       SEFLG_SWIEPH,
-      SE_CALC_SET,
+      SE_BIT_DISC_CENTER + SE_CALC_SET,
       [longitude, latitude, 0],
       1013.25,
       15
@@ -217,7 +216,7 @@ export class PanchangaService {
       SE_MOON,
       "",
       SEFLG_SWIEPH,
-      SE_CALC_RISE,
+      SE_BIT_DISC_CENTER + SE_CALC_RISE,
       [longitude, latitude, 0],
       1013.25,
       15
@@ -241,7 +240,7 @@ export class PanchangaService {
       SE_MOON,
       "",
       SEFLG_SWIEPH,
-      SE_CALC_SET,
+      SE_BIT_DISC_CENTER + SE_CALC_SET,
       [longitude, latitude, 0],
       1013.25,
       15
@@ -302,61 +301,83 @@ export class PanchangaService {
   calculateTithi(jd: number, location: Location): TithiResult[] {
     const { timezone } = location;
 
-    // Determine base local midnight UT for consistent absolute end clock time
-    const jdLocalMidnight = Math.floor(jd - 0.5) + 0.5; // JD at previous 00:00 UT baseline
-    const localMidnightUt = jdLocalMidnight - timezone / 24; // shift by timezone to approximate local midnight in UT
+    // Base JD at 0h UT for end-time display conversion
+    const jdLocalMidnight = Math.floor(jd - 0.5) + 0.5;
 
+    // 1. Calculate lunar phase at the given moment (sunrise)
     const phaseNow = this.lunarPhase(jd);
-    const currentTithi = Math.floor(phaseNow / 12) + 1; // 1..30
-    const targetDeg = currentTithi * 12; // degrees at boundary
 
-    // Step forward in 30 minute increments until we cross the boundary
-    let hi = jd;
-    let phaseHi = phaseNow;
-    const maxForward = jd + 2; // safety (tithi never longer than ~1.9 days)
-    while (phaseHi < targetDeg && hi < maxForward) {
-      hi += 0.0208333333; // 30 minutes
-      phaseHi = this.lunarPhase(hi);
-      if (phaseHi < phaseNow) {
-        // Wrapped around 360 -> add 360 to keep monotonic for search
-        phaseHi += 360;
-      }
-    }
-    // Binary refine between jd (lo) and hi where boundary lies
-    let lo = jd;
-    let iterations = 0;
-    // refine to < 1 minute
-    while (hi - lo > 1 / (24 * 60) && iterations < 40) {
-      const mid = (lo + hi) / 2;
-      let phaseMid = this.lunarPhase(mid);
-      if (phaseMid < phaseNow) phaseMid += 360;
-      if (phaseMid >= targetDeg) {
-        hi = mid;
-        phaseHi = phaseMid;
-      } else {
-        lo = mid;
-      }
-      iterations++;
-    }
-    const endJd = hi; // boundary UT
+    // 2. Determine current tithi using ceil (standard Drik Panchanga formula)
+    let currentTithi = Math.ceil(phaseNow / 12);
+    if (currentTithi <= 0) currentTithi = 30; // phase exactly 0° → end of Amavasya
 
-    // Convert to absolute local clock hours since local midnight (can exceed 24)
-    let hoursSinceLocalMidnight = (endJd - localMidnightUt) * 24;
-    // Ensure non-negative (if numerical drift)
-    while (hoursSinceLocalMidnight < 0) hoursSinceLocalMidnight += 24;
+    // 3. Degrees left to traverse before this tithi ends
+    const degreesLeft = currentTithi * 12 - phaseNow;
+
+    // 4. Compute relative moon-sun motion at intervals after anchor (Lagrange method)
+    const offsets = [0.25, 0.5, 0.75, 1.0];
+    const lunarLongDiff = offsets.map((t) =>
+      (this.lunarLongitude(jd + t) - this.lunarLongitude(jd) + 360) % 360
+    );
+    const solarLongDiff = offsets.map((t) =>
+      (this.solarLongitude(jd + t) - this.solarLongitude(jd) + 360) % 360
+    );
+    const relativeMotion = offsets.map(
+      (_, i) => lunarLongDiff[i] - solarLongDiff[i]
+    );
+
+    // 5. Find end time by 4-point inverse Lagrange interpolation
+    let approxEnd = this.inverseLagrange(offsets, relativeMotion, degreesLeft);
+    if (!isFinite(approxEnd) || approxEnd < 0) approxEnd = 0;
+
+    // Convert to local clock hours
+    let endHours = (jd + approxEnd - jdLocalMidnight) * 24 + timezone;
+    while (endHours < 0) endHours += 24;
 
     // Determine paksha
     const paksha = currentTithi <= 15 ? "Shukla" : "Krishna";
 
-    return [
+    const results: TithiResult[] = [
       {
         number: currentTithi,
         name: this.getTithiName(currentTithi),
-        endTime: this.toDms(hoursSinceLocalMidnight),
+        endTime: this.toDms(endHours),
         paksha,
       },
     ];
+
+    // 6. Check for kshaya (skipped) tithi — if next sunrise's tithi
+    //    jumps by more than 1, a tithi was entirely contained within today
+    const phaseTomorrow = this.lunarPhase(jd + 1);
+    let tithiTomorrow = Math.ceil(phaseTomorrow / 12);
+    if (tithiTomorrow <= 0) tithiTomorrow = 30;
+    const isSkipped = (tithiTomorrow - currentTithi + 30) % 30 > 1;
+
+    if (isSkipped) {
+      const leapTithi = (currentTithi % 30) + 1;
+      const leapDegreesLeft = leapTithi * 12 - phaseNow;
+      let leapApproxEnd = this.inverseLagrange(
+        offsets,
+        relativeMotion,
+        leapDegreesLeft
+      );
+      if (!isFinite(leapApproxEnd) || leapApproxEnd < 0) leapApproxEnd = 0;
+      let leapEndHours =
+        (jd + leapApproxEnd - jdLocalMidnight) * 24 + timezone;
+      while (leapEndHours < 0) leapEndHours += 24;
+
+      const leapPaksha = leapTithi <= 15 ? "Shukla" : "Krishna";
+      results.push({
+        number: leapTithi,
+        name: this.getTithiName(leapTithi),
+        endTime: this.toDms(leapEndHours),
+        paksha: leapPaksha,
+      });
+    }
+
+    return results;
   }
+
 
   /**
    * Calculate Nakshatra (lunar mansion)
@@ -365,31 +386,52 @@ export class PanchangaService {
     sweph.set_sid_mode(SE_SIDM_LAHIRI, 0, 0);
     const { timezone } = location;
     const jdLocalMidnight = Math.floor(jd - 0.5) + 0.5;
-    const localMidnightUt = jdLocalMidnight - timezone / 24;
 
-    const offsets = [0, 1 / 24, 2 / 24, 3 / 24, 4 / 24]; // 1-hour steps for better stability
+    // Use same ayanamsa for all offsets (reference implementation standard)
+    const ayanamsa = sweph.get_ayanamsa_ut(jd);
+    const offsets = [0.0, 0.25, 0.5, 0.75, 1.0];
     const longitudes = offsets.map((t) => {
       const lunarLong = this.lunarLongitude(jd + t);
-      const ayanamsa = sweph.get_ayanamsa_ut(jd + t);
       return (lunarLong - ayanamsa + 360) % 360;
     });
-    const current = Math.floor((longitudes[0] * 27) / 360) + 1; // 1..27
+
+    let current = Math.ceil((longitudes[0] * 27) / 360);
+    if (current <= 0) current = 27;
+
     const targetDeg = current * (360 / 27);
     const y = this.unwrapAngles(longitudes);
-    const x = offsets;
-    let approx = this.inverseLagrange(x, y, targetDeg);
-    if (!isFinite(approx) || approx < 0) approx = 0; // safety
-    const endJd = jd + approx;
-    let hoursSinceLocalMidnight = (endJd - localMidnightUt) * 24;
-    while (hoursSinceLocalMidnight < 0) hoursSinceLocalMidnight += 24;
+    let approx = this.inverseLagrange(offsets, y, targetDeg);
+    if (!isFinite(approx) || approx < 0) approx = 0;
 
-    return [
+    let endHours = (jd + approx - jdLocalMidnight) * 24 + timezone;
+    while (endHours < 0) endHours += 24;
+
+    const results: NakshatraResult[] = [
       {
         number: current,
         name: this.getNakshatraName(current),
-        endTime: this.toDms(hoursSinceLocalMidnight),
+        endTime: this.toDms(endHours),
       },
     ];
+
+    // Check for skipped nakshatra
+    let nakTmrw = Math.ceil((longitudes[longitudes.length - 1] * 27) / 360);
+    if (nakTmrw <= 0) nakTmrw = 27;
+    const isSkipped = (nakTmrw - current + 27) % 27 > 1;
+    if (isSkipped) {
+      const leapNak = (current % 27) + 1;
+      let leapApprox = this.inverseLagrange(offsets, y, leapNak * (360 / 27));
+      if (!isFinite(leapApprox) || leapApprox < 0) leapApprox = 0;
+      let leapEndHours = (jd + leapApprox - jdLocalMidnight) * 24 + timezone;
+      while (leapEndHours < 0) leapEndHours += 24;
+      results.push({
+        number: leapNak,
+        name: this.getNakshatraName(leapNak),
+        endTime: this.toDms(leapEndHours),
+      });
+    }
+
+    return results;
   }
 
   /**
@@ -399,37 +441,72 @@ export class PanchangaService {
     sweph.set_sid_mode(SE_SIDM_LAHIRI, 0, 0);
     const { timezone } = location;
     const jdLocalMidnight = Math.floor(jd - 0.5) + 0.5;
-    const localMidnightUt = jdLocalMidnight - timezone / 24;
 
     const ayanamsa = sweph.get_ayanamsa_ut(jd);
     const lunarLong = (this.lunarLongitude(jd) - ayanamsa + 360) % 360;
     const solarLong = (this.solarLongitude(jd) - ayanamsa + 360) % 360;
     const total = (lunarLong + solarLong) % 360;
-    const current = Math.floor((total * 27) / 360) + 1;
-    const targetDeg = current * (360 / 27);
 
-    // Estimate end time using motion over next few hours
-    const offsets = [0, 1 / 24, 2 / 24, 3 / 24, 4 / 24];
-    const motions = offsets.map((t) => {
-      const ay = sweph.get_ayanamsa_ut(jd + t);
-      const ll = (this.lunarLongitude(jd + t) - ay + 360) % 360;
-      const sl = (this.solarLongitude(jd + t) - ay + 360) % 360;
-      return (ll + sl) % 360;
-    });
-    const y = this.unwrapAngles(motions);
-    let approx = this.inverseLagrange(offsets, y, targetDeg);
+    let current = Math.ceil((total * 27) / 360);
+    if (current <= 0) current = 27;
+
+    const degreesLeft = current * (360 / 27) - total;
+
+    // Compute differential longitudinal sums at intervals
+    const offsets = [0.25, 0.5, 0.75, 1.0];
+    const lunarLongDiff = offsets.map((t) =>
+      (this.lunarLongitude(jd + t) - this.lunarLongitude(jd) + 360) % 360
+    );
+    const solarLongDiff = offsets.map((t) =>
+      (this.solarLongitude(jd + t) - this.solarLongitude(jd) + 360) % 360
+    );
+    const totalMotion = offsets.map(
+      (_, i) => lunarLongDiff[i] + solarLongDiff[i]
+    );
+
+    let approx = this.inverseLagrange(offsets, totalMotion, degreesLeft);
     if (!isFinite(approx) || approx < 0) approx = 0;
-    const endJd = jd + approx;
-    let hoursSinceLocalMidnight = (endJd - localMidnightUt) * 24;
-    while (hoursSinceLocalMidnight < 0) hoursSinceLocalMidnight += 24;
 
-    return [
+    let endHours = (jd + approx - jdLocalMidnight) * 24 + timezone;
+    while (endHours < 0) endHours += 24;
+
+    const results: YogaResult[] = [
       {
         number: current,
         name: this.getYogaName(current),
-        endTime: this.toDms(hoursSinceLocalMidnight),
+        endTime: this.toDms(endHours),
       },
     ];
+
+    // Check for skipped yoga
+    const lunarLongTmrw =
+      (this.lunarLongitude(jd + 1) - ayanamsa + 360) % 360;
+    const solarLongTmrw =
+      (this.solarLongitude(jd + 1) - ayanamsa + 360) % 360;
+    const totalTmrw = (lunarLongTmrw + solarLongTmrw) % 360;
+    let yogTmrw = Math.ceil((totalTmrw * 27) / 360);
+    if (yogTmrw <= 0) yogTmrw = 27;
+    const isSkipped = (yogTmrw - current + 27) % 27 > 1;
+    if (isSkipped) {
+      const leapYog = (current % 27) + 1;
+      const leapDegreesLeft = leapYog * (360 / 27) - total;
+      let leapApprox = this.inverseLagrange(
+        offsets,
+        totalMotion,
+        leapDegreesLeft
+      );
+      if (!isFinite(leapApprox) || leapApprox < 0) leapApprox = 0;
+      let leapEndHours =
+        (jd + leapApprox - jdLocalMidnight) * 24 + timezone;
+      while (leapEndHours < 0) leapEndHours += 24;
+      results.push({
+        number: leapYog,
+        name: this.getYogaName(leapYog),
+        endTime: this.toDms(leapEndHours),
+      });
+    }
+
+    return results;
   }
 
   /**
@@ -441,7 +518,8 @@ export class PanchangaService {
     const lunarLong = this.lunarLongitude(jd);
 
     const moonPhase = (lunarLong - solarLong + 360) % 360; // 0–360°
-    const karanaIndex = Math.floor(moonPhase / 6) + 1; // 1 to 60 in a lunar month
+    let karanaIndex = Math.ceil(moonPhase / 6); // 1 to 60 in a lunar month
+    if (karanaIndex <= 0) karanaIndex = 60;
 
     return {
       number: karanaIndex,
@@ -482,7 +560,7 @@ export class PanchangaService {
       SE_SUN,
       "",
       SEFLG_SWIEPH,
-      SE_CALC_RISE,
+      SE_BIT_DISC_CENTER + SE_CALC_RISE,
       [longitude, latitude, 0],
       1013.25,
       15
@@ -532,18 +610,26 @@ export class PanchangaService {
   private newMoon(jd: number, tithi: number, opt: number): number {
     let start: number;
     if (opt === -1) {
-      start = jd - tithi;
+      start = jd - tithi; // previous new moon
     } else if (opt === 1) {
-      start = jd + (30 - tithi);
+      start = jd + (30 - tithi); // next new moon
     } else {
-      start = jd; // Default fallback
+      start = jd;
     }
 
+    // Search within a span of (start ± 2) days
     const x = Array.from({ length: 17 }, (_, i) => -2 + i / 4);
     const y = x.map((i) => this.lunarPhase(start + i));
+
+    // Use unwrapAngles so the curve ascends through 360° at new moon
     const yUnwrapped = this.unwrapAngles(y);
-    const y0 = this.inverseLagrange(x, yUnwrapped, 360);
-    return start + y0;
+    const y0Offset = this.inverseLagrange(x, yUnwrapped, 360);
+
+    if (!isFinite(y0Offset)) {
+      return start; // fallback
+    }
+
+    return start + y0Offset;
   }
 
   /**
@@ -561,49 +647,50 @@ export class PanchangaService {
    * Get complete Panchanga for a given date and location
    */
   getPanchanga(date: PanchangaDate, location: Location): PanchangaResult {
+    // Base JD for the date at 00:00 local
     const baseDate: PanchangaDate = {
       year: date.year,
       month: date.month,
       day: date.day,
     };
-
     const jdDate = this.gregorianToJd(baseDate);
-
-    // Anchor UT for tithi/nakshatra/yoga
+    
+    // If no specific time provided, use SUNRISE for tithi calculation
+    // (Hindu calendar dates change at sunrise, not midnight)
     const hasTime = date.hour !== undefined && date.minute !== undefined;
-    const jdWithTime = hasTime ? this.gregorianToJd(date) : jdDate;
-    const anchorUt = jdWithTime - location.timezone / 24;
-
-    // 🔥 TRUE sunrise JD for this Gregorian day
-    const sunriseResult = sweph.rise_trans(
-      jdDate - location.timezone / 24,
-      SE_SUN,
-      "",
-      SEFLG_SWIEPH,
-      SE_CALC_RISE,
-      [location.longitude, location.latitude, 0],
-      1013.25,
-      15
-    );
-
-    if (sunriseResult.error) {
-      throw new Error(`Sunrise error: ${sunriseResult.error}`);
+    let anchorUt: number;
+    
+    if (hasTime) {
+      // User provided specific time - use it as-is
+      const jdWithTime = this.gregorianToJd(date);
+      anchorUt = jdWithTime - location.timezone / 24;
+    } else {
+      // No time provided - calculate at SUNRISE (proper Hindu calendar)
+      const { latitude, longitude, timezone } = location;
+      const result = sweph.rise_trans(
+        jdDate - timezone / 24,
+        SE_SUN,
+        "",
+        SEFLG_SWIEPH,
+        SE_BIT_DISC_CENTER + SE_CALC_RISE,
+        [longitude, latitude, 0],
+        1013.25,
+        15
+      );
+      if (result.error) {
+        throw new Error(`Sunrise calculation error: ${result.error}`);
+      }
+      anchorUt = result.data; // Use sunrise JD (UT) for calculations
     }
 
-    const sunriseJd = sunriseResult.data;
-
-    return {
+    const result: PanchangaResult = {
       date,
       location,
-
       tithi: this.calculateTithi(anchorUt, location),
       nakshatra: this.calculateNakshatra(anchorUt, location),
       yoga: this.calculateYoga(anchorUt, location),
       karana: this.calculateKarana(anchorUt),
-
-      // ✅ THIS IS THE FIX
-      masa: this.calculateMasa(sunriseJd, location),
-
+      masa: this.calculateMasa(jdDate, location), // Masa traditionally at sunrise
       vaara: this.calculateVaaraFromDate(baseDate),
       sunrise: this.sunrise(jdDate, location),
       sunset: this.sunset(jdDate, location),
@@ -611,6 +698,8 @@ export class PanchangaService {
       moonset: this.moonset(jdDate, location),
       dayDuration: this.calculateDayDuration(jdDate, location),
     };
+
+    return result;
   }
 
   /**
@@ -769,136 +858,258 @@ export class PanchangaService {
     return names[number] || `Masa ${number}`;
   }
 
+  /**
+   * Compute tithi at a specific local time on a given date.
+   * Used for shraddha (aparahna check at ~12:00–15:00).
+   */
+  private getTithiAtLocalTime(
+    year: number,
+    month: number,
+    day: number,
+    localHour: number,
+    localMinute: number,
+    location: Location
+  ): { number: number; paksha: string } {
+    const jdDate = sweph.julday(year, month, day, 0, SE_GREG_CAL);
+    const jdAtTime =
+      jdDate + (localHour + localMinute / 60 - location.timezone) / 24;
+    const phase = this.lunarPhase(jdAtTime);
+    let tithi = Math.ceil(phase / 12);
+    if (tithi <= 0) tithi = 30;
+    const paksha = tithi <= 15 ? "Shukla" : "Krishna";
+    return { number: tithi, paksha };
+  }
+
+  /**
+   * Check if target tithi is present during aparahna period (12 noon – 3 PM).
+   * Checks at noon, 1:30 PM, and 3 PM to cover the window.
+   */
+  private isTithiInAparahna(
+    year: number,
+    month: number,
+    day: number,
+    targetTithi: number,
+    targetPaksha: string,
+    location: Location
+  ): boolean {
+    const checkTimes = [
+      [12, 0],
+      [13, 30],
+      [15, 0],
+    ];
+    for (const [h, m] of checkTimes) {
+      const t = this.getTithiAtLocalTime(year, month, day, h, m, location);
+      if (t.number === targetTithi && t.paksha === targetPaksha) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Event-type-aware tithi match check.
+   * Birthday/Marriage: tithi at sunrise (default getPanchanga behavior)
+   * Shraddha: tithi present during aparahna (12 noon – 3 PM)
+   *
+   * Rules from traditional panchanga:
+   * - Birthday: follow tithi at sunrise; only nija masa (skip adhika)
+   * - Shraddha: follow tithi during aparahna; both adhika and nija masa
+   * - Marriage: follow tithi at sunrise (same as birthday)
+   */
+  private checkDateForEvent(
+    testDate: PanchangaDate,
+    location: Location,
+    targetTithi: number,
+    targetPaksha: string,
+    targetMasa: number,
+    eventType?: string
+  ): {
+    matched: boolean;
+    panchanga: PanchangaResult | null;
+    isAdhikaMasa: boolean;
+  } {
+    const panchanga = this.getPanchanga(testDate, location);
+    const isAdhikaMasa = panchanga.masa.isAdhika;
+
+    // Check masa match
+    const isMasaMatch = panchanga.masa.number === targetMasa;
+    if (!isMasaMatch) {
+      return { matched: false, panchanga, isAdhikaMasa };
+    }
+
+    // Birthday/Marriage: skip adhika masa (celebrate only in nija masa)
+    if (
+      (eventType === "birthday" || eventType === "marriage") &&
+      isAdhikaMasa
+    ) {
+      return { matched: false, panchanga, isAdhikaMasa };
+    }
+
+    // Check tithi based on event type
+    let isTithiMatch: boolean;
+    if (eventType === "shraddha") {
+      // Shraddha: tithi must be present during aparahna (12 noon – 3 PM)
+      isTithiMatch = this.isTithiInAparahna(
+        testDate.year,
+        testDate.month,
+        testDate.day,
+        targetTithi,
+        targetPaksha,
+        location
+      );
+    } else {
+      // Birthday/Marriage/default: tithi at sunrise
+      isTithiMatch = panchanga.tithi.some(
+        (t) => t.number === targetTithi && t.paksha === targetPaksha
+      );
+    }
+
+    return { matched: isTithiMatch && isMasaMatch, panchanga, isAdhikaMasa };
+  }
+
   public findMatchingDates(
     baseDate: PanchangaDate,
     location: Location,
     range: number,
-    targetYear?: number
+    eventType?: string
   ): MatchingDate[] {
-    const results: MatchingDate[] = [];
+    const matches: MatchingDate[] = [];
 
-    // 🔹 Birth Panchanga reference
+    // For shraddha base date, also check aparahna tithi
     const basePanchanga = this.getPanchanga(baseDate, location);
 
-    const baseTithi = basePanchanga.tithi[0].number;
-    const basePaksha = basePanchanga.tithi[0].paksha;
-    const baseNakshatra = basePanchanga.nakshatra[0].number;
+    let baseTithi: number;
+    let basePaksha: string;
+    if (eventType === "shraddha") {
+      // For shraddha, determine the base tithi at aparahna of the input date
+      const aparahnaTithi = this.getTithiAtLocalTime(
+        baseDate.year,
+        baseDate.month,
+        baseDate.day,
+        13,
+        30,
+        location
+      );
+      baseTithi = aparahnaTithi.number;
+      basePaksha = aparahnaTithi.paksha;
+    } else {
+      baseTithi = basePanchanga.tithi[0].number;
+      basePaksha = basePanchanga.tithi[0].paksha;
+    }
     const baseMasa = basePanchanga.masa.number;
 
-    // 🔹 Range around TARGET YEAR or CURRENT YEAR
-    const baseYear = targetYear ? Number(targetYear) : new Date().getFullYear();
-    const startYear = baseYear - range;
-    const endYear = baseYear + range;
-
+    // Use current year as base for range calculation, not the user's selected date
+    const currentYear = new Date().getFullYear();
+    const startYear = currentYear - range;
+    const endYear = currentYear + range;
 
     for (let year = startYear; year <= endYear; year++) {
-      const yearMatches: MatchingDate[] = [];
+      let foundInYear = false;
 
+      // For shraddha, we may find two dates per year (adhika + nija),
+      // so we track count separately
+      let matchCountInYear = 0;
 
-      // 🔥 MASA-AWARE SEARCH WINDOW (CRITICAL FIX)
-      // Pausha (10) spans December → January
-      const searchMonths =
-        baseMasa === 10 // Pausha
-          ? [11, 12, 1, 2] // Nov–Feb
-          : [
-              baseDate.month - 2,
-              baseDate.month - 1,
-              baseDate.month,
-              baseDate.month + 1,
-              baseDate.month + 2,
-            ].filter((m) => m >= 1 && m <= 12);
+      // ✅ Focused search window: ±2 months around base month
+      const searchStartMonth = Math.max(1, baseDate.month - 2);
+      const searchEndMonth = Math.min(12, baseDate.month + 2);
 
-
-      for (const month of searchMonths) {
+      for (let month = searchStartMonth; month <= searchEndMonth; month++) {
         const daysInMonth = new Date(year, month, 0).getDate();
 
         for (let day = 1; day <= daysInMonth; day++) {
-          const testDate: PanchangaDate = {
-            year,
-            month,
-            day,
-            calendar: baseDate.calendar || "gregorian",
-          };
+          try {
+            const testDate: PanchangaDate = {
+              year,
+              month,
+              day,
+              calendar: baseDate.calendar || "gregorian",
+            };
 
-          // 🔹 Sunrise boundary safety
-          const testDates: PanchangaDate[] = [
-            testDate,
-            { ...testDate, day: day - 1 },
-          ];
+            const result = this.checkDateForEvent(
+              testDate,
+              location,
+              baseTithi,
+              basePaksha,
+              baseMasa,
+              eventType
+            );
 
-          for (const d of testDates) {
-            if (d.day < 1) continue;
+            if (result.matched && result.panchanga) {
+              matches.push({
+                date: testDate,
+                fields: {
+                  tithi: baseTithi,
+                  paksha: basePaksha,
+                  nakshatra: result.panchanga.nakshatra[0].number,
+                  yoga: result.panchanga.yoga[0].number,
+                  karana: result.panchanga.karana.number,
+                  masa: baseMasa,
+                  vaara: result.panchanga.vaara,
+                },
+              });
 
+              matchCountInYear++;
+              // For shraddha with adhika masa, allow finding both adhika+nija
+              if (eventType === "shraddha") {
+                if (matchCountInYear >= 2) {
+                  foundInYear = true;
+                  break;
+                }
+                // Don't break after first match — keep looking for nija/adhika
+              } else {
+                foundInYear = true;
+                break; // ✅ stop days for birthday/marriage
+              }
+            }
+          } catch {
+            continue;
+          }
+        }
+
+        if (foundInYear) break; // ✅ stop months
+      }
+
+      // 🔹 Full year search (only if not found in optimized ±2 month window)
+      if (!foundInYear) {
+        // Search entire year if not found in optimized window
+        for (let month = 1; month <= 12 && !foundInYear; month++) {
+          // Skip months already searched in the optimized window
+          if (month >= searchStartMonth && month <= searchEndMonth) {
+            continue;
+          }
+
+          const daysInMonth = new Date(year, month, 0).getDate();
+
+          for (let day = 1; day <= daysInMonth; day++) {
             try {
-              // Debug for December dates
-              if (d.month === 12 && d.day >= 20) {
-                console.log(
-                  `🔍 SERVICE DEBUG: Testing December date ${d.year}-${d.month}-${d.day}`
-                );
-              }
+              const testDate: PanchangaDate = {
+                year,
+                month,
+                day,
+                calendar: baseDate.calendar || "gregorian",
+              };
 
-              const panchanga = this.getPanchanga(d, location);
+              const result = this.checkDateForEvent(
+                testDate, location, baseTithi, basePaksha, baseMasa, eventType
+              );
 
-              const isTithiMatch =
-                panchanga.tithi[0].number === baseTithi &&
-                panchanga.tithi[0].paksha === basePaksha;
-
-              const isNakshatraMatch =
-                panchanga.nakshatra[0].number === baseNakshatra;
-
-              const isMasaMatch = panchanga.masa.number === baseMasa;
-
-              // Debug for December dates that might match
-              if (d.month === 12 && d.day >= 20) {
-                console.log(
-                  `🔍 SERVICE DEBUG: December ${d.day} - Tithi: ${panchanga.tithi[0].number} ${panchanga.tithi[0].paksha}, Nakshatra: ${panchanga.nakshatra[0].number}, Masa: ${panchanga.masa.number}`
-                );
-                console.log(
-                  `🔍 SERVICE DEBUG: Matches - Tithi: ${isTithiMatch}, Nakshatra: ${isNakshatraMatch}, Masa: ${isMasaMatch}`
-                );
-              }
-
-              // Priority matching: Tithi + Masa is most important, Nakshatra is secondary
-              const isPrimaryMatch = isTithiMatch && isMasaMatch; // Tithi + Masa
-              const isExactMatch =
-                isTithiMatch && isNakshatraMatch && isMasaMatch; // All three
-
-              if (isPrimaryMatch) {
-                const nakshatraDistance = Math.abs(
-                  panchanga.nakshatra[0].number - baseNakshatra
-                );
-
-                yearMatches.push({
-                  date: testDate, // ✅ real Gregorian date
+              if (result.matched && result.panchanga) {
+                matches.push({
+                  date: testDate,
                   fields: {
                     tithi: baseTithi,
                     paksha: basePaksha,
-                    nakshatra: baseNakshatra,
-                    yoga: panchanga.yoga[0].number,
-                    karana: panchanga.karana.number,
+                    nakshatra: result.panchanga.nakshatra[0].number,
+                    yoga: result.panchanga.yoga[0].number,
+                    karana: result.panchanga.karana.number,
                     masa: baseMasa,
-                    vaara: panchanga.vaara,
+                    vaara: result.panchanga.vaara,
                   },
-                  matchQuality: isExactMatch ? "exact" : "primary",
-                  nakshatraDistance: nakshatraDistance,
                 });
 
-                if (isPrimaryMatch) {
-                  console.log(
-                    "🔍 SERVICE DEBUG: PRIMARY MATCH FOUND!",
-                    testDate,
-                    {
-                      tithi:
-                        panchanga.tithi[0].number +
-                        " " +
-                        panchanga.tithi[0].paksha,
-                      nakshatra: panchanga.nakshatra[0].number,
-                      masa: panchanga.masa.number,
-                      quality: isExactMatch ? "exact" : "primary",
-                      nakshatraDistance: nakshatraDistance,
-                    }
-                  );
-                }
+                foundInYear = true;
+                break;
               }
             } catch {
               continue;
@@ -907,41 +1118,526 @@ export class PanchangaService {
         }
       }
 
-      // 🔹 Pick ONLY ONE correct date per year
-      if (yearMatches.length > 0) {
-        yearMatches.sort((a, b) => {
-          // Priority 1: Prefer December Pausha over January Pausha (traditional preference)
-          if (a.date.month !== b.date.month) {
-            return b.date.month - a.date.month; // Dec (12) > Jan (1)
+      // 🔹 Adjacent year search (only if still not found after full year search)
+      if (!foundInYear) {
+        // November–December of previous year
+        for (let month = 11; month <= 12 && !foundInYear; month++) {
+          const prevYear = year - 1;
+          const daysInMonth = new Date(prevYear, month, 0).getDate();
+
+          for (let day = 1; day <= daysInMonth; day++) {
+            try {
+              const testDate: PanchangaDate = {
+                year: prevYear,
+                month,
+                day,
+                calendar: baseDate.calendar || "gregorian",
+              };
+
+              const result = this.checkDateForEvent(
+                testDate, location, baseTithi, basePaksha, baseMasa, eventType
+              );
+
+              if (result.matched && result.panchanga) {
+                matches.push({
+                  date: testDate,
+                  fields: {
+                    tithi: baseTithi,
+                    paksha: basePaksha,
+                    nakshatra: result.panchanga.nakshatra[0].number,
+                    yoga: result.panchanga.yoga[0].number,
+                    karana: result.panchanga.karana.number,
+                    masa: baseMasa,
+                    vaara: result.panchanga.vaara,
+                  },
+                });
+                foundInYear = true;
+                break;
+              }
+            } catch {
+              continue;
+            }
           }
+        }
 
-          // Priority 2: Exact matches over primary matches within same month
-          if (a.matchQuality !== b.matchQuality) {
-            if (a.matchQuality === "exact") return -1;
-            if (b.matchQuality === "exact") return 1;
+        // January–February of next year
+        for (let month = 1; month <= 2 && !foundInYear; month++) {
+          const nextYear = year + 1;
+          const daysInMonth = new Date(nextYear, month, 0).getDate();
+
+          for (let day = 1; day <= daysInMonth; day++) {
+            try {
+              const testDate: PanchangaDate = {
+                year: nextYear,
+                month,
+                day,
+                calendar: baseDate.calendar || "gregorian",
+              };
+
+              const result = this.checkDateForEvent(
+                testDate, location, baseTithi, basePaksha, baseMasa, eventType
+              );
+
+              if (result.matched && result.panchanga) {
+                matches.push({
+                  date: testDate,
+                  fields: {
+                    tithi: baseTithi,
+                    paksha: basePaksha,
+                    nakshatra: result.panchanga.nakshatra[0].number,
+                    yoga: result.panchanga.yoga[0].number,
+                    karana: result.panchanga.karana.number,
+                    masa: baseMasa,
+                    vaara: result.panchanga.vaara,
+                  },
+                });
+                foundInYear = true;
+                break;
+              }
+            } catch {
+              continue;
+            }
           }
-
-          // Priority 3: Closer nakshatra distance
-          if (a.nakshatraDistance !== b.nakshatraDistance) {
-            return (a.nakshatraDistance || 0) - (b.nakshatraDistance || 0);
-          }
-
-          // Priority 4: Earlier day in month
-          return a.date.day - b.date.day;
-        });
-
-        results.push(yearMatches[0]);
+        }
       }
-      // else → no Vedic birthday this year (valid)
+
+      // 🔹 FALLBACK: If still not found, find nearest date with relaxed criteria
+      if (!foundInYear) {
+        // Fallback 1: Same tithi + paksha, ANY masa (masa shift due to Adhika Masa or calendar variations)
+        for (let month = 1; month <= 12 && !foundInYear; month++) {
+          const daysInMonth = new Date(year, month, 0).getDate();
+
+          for (let day = 1; day <= daysInMonth; day++) {
+            try {
+              const testDate: PanchangaDate = {
+                year,
+                month,
+                day,
+                calendar: baseDate.calendar || "gregorian",
+              };
+
+              const panchanga = this.getPanchanga(testDate, location);
+
+              const isTithiMatch = panchanga.tithi.some(
+                (t) => t.number === baseTithi && t.paksha === basePaksha
+              );
+
+              // Match tithi+paksha even if masa is different
+              if (isTithiMatch) {
+                matches.push({
+                  date: testDate,
+                  fields: {
+                    tithi: baseTithi,
+                    paksha: basePaksha,
+                    nakshatra: panchanga.nakshatra[0].number,
+                    yoga: panchanga.yoga[0].number,
+                    karana: panchanga.karana.number,
+                    masa: panchanga.masa.number, // Actual masa (may differ from expected)
+                    vaara: panchanga.vaara,
+                  },
+                });
+                foundInYear = true;
+                break;
+              }
+            } catch {
+              continue;
+            }
+          }
+        }
+      }
+
+      // 🔹 FALLBACK 2: If STILL not found, find nearest tithi (any paksha, any masa)
+      if (!foundInYear) {
+        let nearestDate: MatchingDate | null = null;
+        let smallestTithiDiff = Infinity;
+
+        for (let month = 1; month <= 12; month++) {
+          const daysInMonth = new Date(year, month, 0).getDate();
+
+          for (let day = 1; day <= daysInMonth; day++) {
+            try {
+              const testDate: PanchangaDate = {
+                year,
+                month,
+                day,
+                calendar: baseDate.calendar || "gregorian",
+              };
+
+              const panchanga = this.getPanchanga(testDate, location);
+              const currentTithi = panchanga.tithi[0].number;
+
+              // Calculate tithi difference (circular distance, considering 1-30 wraparound)
+              let diff = Math.abs(currentTithi - baseTithi);
+              if (diff > 15) diff = 30 - diff; // Handle wraparound (e.g., 30 vs 1)
+
+              // Prefer same paksha, but allow any if needed
+              const samePaksha = panchanga.tithi[0].paksha === basePaksha;
+              const effectiveDiff = samePaksha ? diff : diff + 0.5; // Slight penalty for different paksha
+
+              if (effectiveDiff < smallestTithiDiff) {
+                smallestTithiDiff = effectiveDiff;
+                nearestDate = {
+                  date: testDate,
+                  fields: {
+                    tithi: panchanga.tithi[0].number,
+                    paksha: panchanga.tithi[0].paksha,
+                    nakshatra: panchanga.nakshatra[0].number,
+                    yoga: panchanga.yoga[0].number,
+                    karana: panchanga.karana.number,
+                    masa: panchanga.masa.number,
+                    vaara: panchanga.vaara,
+                  },
+                };
+              }
+            } catch {
+              continue;
+            }
+          }
+        }
+
+        // Add nearest date if found
+        if (nearestDate) {
+          matches.push(nearestDate);
+          foundInYear = true;
+        }
+      }
+
+      if (!foundInYear) {
+        console.warn(`No matching date found for year ${year}`);
+      }
     }
 
-    // 🔹 Final chronological sort
-    results.sort((a, b) => {
-      const da = new Date(a.date.year, a.date.month - 1, a.date.day).getTime();
-      const db = new Date(b.date.year, b.date.month - 1, b.date.day).getTime();
-      return da - db;
+    // ✅ Sort final results
+    matches.sort((a, b) => {
+      const dateA = new Date(a.date.year, a.date.month - 1, a.date.day);
+      const dateB = new Date(b.date.year, b.date.month - 1, b.date.day);
+      return dateA.getTime() - dateB.getTime();
     });
 
-    return results;
+    return matches;
+  }
+
+  /**
+   * Find dates matching specific tithi, paksha, and masa values
+   * Used by scheduler for generating event occurrences
+   * 
+   * @param tithi - Tithi number (1-30)
+   * @param paksha - Paksha (Krishna or Shukla)
+   * @param masa - Masa number (1-12)
+   * @param location - Geographic location
+   * @param targetYears - Array of years to search
+   * @param baseMonth - Optional hint for which month to search around (default: masa value)
+   * @returns Array of matching dates
+   */
+  public findDatesByLunarValues(
+    tithi: number,
+    paksha: string,
+    masa: number,
+    location: Location,
+    targetYears: number[],
+    baseMonth: number = null
+  ): MatchingDate[] {
+    const matches: MatchingDate[] = [];
+    const searchMonth = baseMonth || masa;
+
+    for (const year of targetYears) {
+      let foundInYear = false;
+
+      // ✅ Focused search window: ±2 months around base month
+      const searchStartMonth = Math.max(1, searchMonth - 2);
+      const searchEndMonth = Math.min(12, searchMonth + 2);
+
+      for (let month = searchStartMonth; month <= searchEndMonth && !foundInYear; month++) {
+        const daysInMonth = new Date(year, month, 0).getDate();
+
+        for (let day = 1; day <= daysInMonth; day++) {
+          try {
+            const testDate: PanchangaDate = {
+              year,
+              month,
+              day,
+              calendar: "gregorian",
+            };
+
+            const panchanga = this.getPanchanga(testDate, location);
+
+            const isTithiMatch = panchanga.tithi.some(
+              (t) => t.number === tithi && t.paksha === paksha
+            );
+
+            const isMasaMatch = panchanga.masa.number === masa;
+
+            if (isTithiMatch && isMasaMatch) {
+              matches.push({
+                date: testDate,
+                fields: {
+                  tithi: tithi,
+                  paksha: paksha,
+                  nakshatra: panchanga.nakshatra[0].number,
+                  yoga: panchanga.yoga[0].number,
+                  karana: panchanga.karana.number,
+                  masa: masa,
+                  vaara: panchanga.vaara,
+                },
+              });
+
+              foundInYear = true;
+              break; // ✅ stop days
+            }
+          } catch {
+            continue;
+          }
+        }
+      }
+
+      // 🔹 Full year search (only if not found in optimized ±2 month window)
+      if (!foundInYear) {
+        // Search entire year if not found in optimized window
+        for (let month = 1; month <= 12 && !foundInYear; month++) {
+          // Skip months already searched in the optimized window
+          if (month >= searchStartMonth && month <= searchEndMonth) {
+            continue;
+          }
+
+          const daysInMonth = new Date(year, month, 0).getDate();
+
+          for (let day = 1; day <= daysInMonth; day++) {
+            try {
+              const testDate: PanchangaDate = {
+                year,
+                month,
+                day,
+                calendar: "gregorian",
+              };
+
+              const panchanga = this.getPanchanga(testDate, location);
+
+              const isTithiMatch = panchanga.tithi.some(
+                (t) => t.number === tithi && t.paksha === paksha
+              );
+              const isMasaMatch = panchanga.masa.number === masa;
+
+              if (isTithiMatch && isMasaMatch) {
+                matches.push({
+                  date: testDate,
+                  fields: {
+                    tithi: tithi,
+                    paksha: paksha,
+                    nakshatra: panchanga.nakshatra[0].number,
+                    yoga: panchanga.yoga[0].number,
+                    karana: panchanga.karana.number,
+                    masa: masa,
+                    vaara: panchanga.vaara,
+                  },
+                });
+                foundInYear = true;
+                break;
+              }
+            } catch {
+              continue;
+            }
+          }
+        }
+      }
+
+      // 🔹 Adjacent year search (only if still not found after full year search)
+      if (!foundInYear) {
+        // November–December of previous year
+        for (let month = 11; month <= 12 && !foundInYear; month++) {
+          const prevYear = year - 1;
+          const daysInMonth = new Date(prevYear, month, 0).getDate();
+
+          for (let day = 1; day <= daysInMonth; day++) {
+            try {
+              const testDate: PanchangaDate = {
+                year: prevYear,
+                month,
+                day,
+                calendar: "gregorian",
+              };
+
+              const panchanga = this.getPanchanga(testDate, location);
+
+              const isTithiMatch = panchanga.tithi.some(
+                (t) => t.number === tithi && t.paksha === paksha
+              );
+              const isMasaMatch = panchanga.masa.number === masa;
+
+              if (isTithiMatch && isMasaMatch) {
+                matches.push({
+                  date: testDate,
+                  fields: {
+                    tithi: tithi,
+                    paksha: paksha,
+                    nakshatra: panchanga.nakshatra[0].number,
+                    yoga: panchanga.yoga[0].number,
+                    karana: panchanga.karana.number,
+                    masa: masa,
+                    vaara: panchanga.vaara,
+                  },
+                });
+                foundInYear = true;
+                break;
+              }
+            } catch {
+              continue;
+            }
+          }
+        }
+
+        // January–February of next year
+        for (let month = 1; month <= 2 && !foundInYear; month++) {
+          const nextYear = year + 1;
+          const daysInMonth = new Date(nextYear, month, 0).getDate();
+
+          for (let day = 1; day <= daysInMonth; day++) {
+            try {
+              const testDate: PanchangaDate = {
+                year: nextYear,
+                month,
+                day,
+                calendar: "gregorian",
+              };
+
+              const panchanga = this.getPanchanga(testDate, location);
+
+              const isTithiMatch = panchanga.tithi.some(
+                (t) => t.number === tithi && t.paksha === paksha
+              );
+              const isMasaMatch = panchanga.masa.number === masa;
+
+              if (isTithiMatch && isMasaMatch) {
+                matches.push({
+                  date: testDate,
+                  fields: {
+                    tithi: tithi,
+                    paksha: paksha,
+                    nakshatra: panchanga.nakshatra[0].number,
+                    yoga: panchanga.yoga[0].number,
+                    karana: panchanga.karana.number,
+                    masa: masa,
+                    vaara: panchanga.vaara,
+                  },
+                });
+                foundInYear = true;
+                break;
+              }
+            } catch {
+              continue;
+            }
+          }
+        }
+      }
+
+      // 🔹 FALLBACK: If still not found, find nearest date with relaxed criteria
+      if (!foundInYear) {
+        // Fallback 1: Same tithi + paksha, ANY masa (masa shift due to Adhika Masa or calendar variations)
+        for (let month = 1; month <= 12 && !foundInYear; month++) {
+          const daysInMonth = new Date(year, month, 0).getDate();
+
+          for (let day = 1; day <= daysInMonth; day++) {
+            try {
+              const testDate: PanchangaDate = {
+                year,
+                month,
+                day,
+                calendar: "gregorian",
+              };
+
+              const panchanga = this.getPanchanga(testDate, location);
+
+              const isTithiMatch = panchanga.tithi.some(
+                (t) => t.number === tithi && t.paksha === paksha
+              );
+
+              // Match tithi+paksha even if masa is different
+              if (isTithiMatch) {
+                matches.push({
+                  date: testDate,
+                  fields: {
+                    tithi: tithi,
+                    paksha: paksha,
+                    nakshatra: panchanga.nakshatra[0].number,
+                    yoga: panchanga.yoga[0].number,
+                    karana: panchanga.karana.number,
+                    masa: panchanga.masa.number, // Actual masa (may differ from expected)
+                    vaara: panchanga.vaara,
+                  },
+                });
+                foundInYear = true;
+                break;
+              }
+            } catch {
+              continue;
+            }
+          }
+        }
+      }
+
+      // 🔹 FALLBACK 2: If STILL not found, find nearest tithi (any paksha, any masa)
+      if (!foundInYear) {
+        let nearestDate: MatchingDate | null = null;
+        let smallestTithiDiff = Infinity;
+
+        for (let month = 1; month <= 12; month++) {
+          const daysInMonth = new Date(year, month, 0).getDate();
+
+          for (let day = 1; day <= daysInMonth; day++) {
+            try {
+              const testDate: PanchangaDate = {
+                year,
+                month,
+                day,
+                calendar: "gregorian",
+              };
+
+              const panchanga = this.getPanchanga(testDate, location);
+              const currentTithi = panchanga.tithi[0].number;
+
+              // Calculate tithi difference (circular distance, considering 1-30 wraparound)
+              let diff = Math.abs(currentTithi - tithi);
+              if (diff > 15) diff = 30 - diff; // Handle wraparound (e.g., 30 vs 1)
+
+              // Prefer same paksha, but allow any if needed
+              const samePaksha = panchanga.tithi[0].paksha === paksha;
+              const effectiveDiff = samePaksha ? diff : diff + 0.5; // Slight penalty for different paksha
+
+              if (effectiveDiff < smallestTithiDiff) {
+                smallestTithiDiff = effectiveDiff;
+                nearestDate = {
+                  date: testDate,
+                  fields: {
+                    tithi: panchanga.tithi[0].number,
+                    paksha: panchanga.tithi[0].paksha,
+                    nakshatra: panchanga.nakshatra[0].number,
+                    yoga: panchanga.yoga[0].number,
+                    karana: panchanga.karana.number,
+                    masa: panchanga.masa.number,
+                    vaara: panchanga.vaara,
+                  },
+                };
+              }
+            } catch {
+              continue;
+            }
+          }
+        }
+
+        // Add nearest date if found
+        if (nearestDate) {
+          matches.push(nearestDate);
+          foundInYear = true;
+        }
+      }
+    }
+
+    // ✅ Sort final results
+    matches.sort((a, b) => {
+      const dateA = new Date(a.date.year, a.date.month - 1, a.date.day);
+      const dateB = new Date(b.date.year, b.date.month - 1, b.date.day);
+      return dateA.getTime() - dateB.getTime();
+    });
+
+    return matches;
   }
 }
